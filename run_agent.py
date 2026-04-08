@@ -8930,8 +8930,79 @@ class AIAgent:
                             self._save_session_log(messages)
                             continue
 
-                        # Exhausted prefill attempts or no structured
-                        # reasoning — fall through to "(empty)" terminal.
+                        # ── Empty-after-tools retry ───────────────────────
+                        # Common pattern: model did tool calls, received
+                        # results, then produced an empty response because
+                        # it considers the task done.  Before giving up,
+                        # check if there were recent tool calls and nudge
+                        # the model once to produce a visible response.
+                        _had_recent_tools = any(
+                            isinstance(m, dict)
+                            and m.get("role") == "tool"
+                            for m in messages[-6:]
+                        )
+                        if _had_recent_tools and self._empty_content_retries < 1:
+                            self._empty_content_retries += 1
+                            self._vprint(
+                                f"{self.log_prefix}↻ Empty response after tool calls — "
+                                f"nudging model for content"
+                            )
+                            # Append the empty assistant message so history
+                            # stays valid, then add a continue nudge.
+                            interim_msg = self._build_assistant_message(
+                                assistant_message, "incomplete"
+                            )
+                            interim_msg["content"] = ""
+                            messages.append(interim_msg)
+                            messages.append({
+                                "role": "user",
+                                "content": (
+                                    "[System: Your last response was empty. "
+                                    "Please provide your answer to the user. "
+                                    "Do not call any more tools — just respond "
+                                    "with your final message.]"
+                                ),
+                            })
+                            self._session_messages = messages
+                            self._save_session_log(messages)
+                            continue
+
+                        # ── History content fallback ──────────────────────
+                        # Before returning "(empty)", scan the conversation
+                        # history for the most recent substantive assistant
+                        # content that was already delivered (e.g. streamed
+                        # to the user alongside tool calls in an earlier
+                        # turn).  This recovers the response that the model
+                        # considers already delivered.
+                        _history_fallback = None
+                        for _hi in range(len(messages) - 1, -1, -1):
+                            _hm = messages[_hi]
+                            if not isinstance(_hm, dict):
+                                continue
+                            if _hm.get("role") != "assistant":
+                                continue
+                            _hc = _hm.get("content", "")
+                            if not _hc or _hc == "(empty)":
+                                continue
+                            # Skip synthetic "Calling the X tool..." messages
+                            if _hc.startswith("Calling the ") and _hc.endswith("..."):
+                                continue
+                            _hc_clean = self._strip_think_blocks(_hc).strip()
+                            if _hc_clean and len(_hc_clean) > 2:
+                                _history_fallback = _hc_clean
+                                break
+                        if _history_fallback:
+                            logger.debug(
+                                "Empty final response — using last substantive "
+                                "assistant content from history (%d chars)",
+                                len(_history_fallback),
+                            )
+                            final_response = _history_fallback
+                            self._response_was_previewed = True
+                            break
+
+                        # Exhausted all recovery attempts — fall through to
+                        # "(empty)" terminal.
                         reasoning_text = self._extract_reasoning(assistant_message)
                         assistant_msg = self._build_assistant_message(assistant_message, finish_reason)
                         assistant_msg["content"] = "(empty)"
