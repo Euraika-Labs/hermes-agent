@@ -30,6 +30,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import List, Optional
 
+from hermes_constants import get_hermes_home
+
 _PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 # Directories bootstrapped inside every new profile
@@ -115,15 +117,27 @@ _HERMES_SUBCOMMANDS = frozenset({
 def _get_profiles_root() -> Path:
     """Return the directory where named profiles are stored.
 
-    Always ``~/.hermes/profiles/`` — anchored to the user's home,
-    NOT to the current HERMES_HOME (which may itself be a profile).
-    This ensures ``coder profile list`` can see all profiles.
+    Anchored to the default Hermes home, not the currently active profile.
+    This keeps named profiles discoverable even when HERMES_HOME points at a
+    profile directory, while still honoring installer-managed custom homes.
     """
-    return Path.home() / ".hermes" / "profiles"
+    return _get_default_hermes_home() / "profiles"
 
 
 def _get_default_hermes_home() -> Path:
-    """Return the default (pre-profile) HERMES_HOME path."""
+    """Return the default (pre-profile) HERMES_HOME path.
+
+    Honors a custom HERMES_HOME root (for example the Windows installer using
+    ``%LOCALAPPDATA%\\hermes``). If the current HERMES_HOME already points to a
+    named profile under ``<root>/profiles/<name>``, returns the parent root.
+    """
+    env_home = os.getenv("HERMES_HOME", "").strip()
+    if env_home:
+        path = Path(env_home).expanduser()
+        if path.parent.name == "profiles" and _PROFILE_ID_RE.match(path.name):
+            return path.parent.parent
+        if path.name in {"hermes", ".hermes"} or (path / "profiles").exists() or (path / "active_profile").exists():
+            return path
     return Path.home() / ".hermes"
 
 
@@ -134,7 +148,23 @@ def _get_active_profile_path() -> Path:
 
 def _get_wrapper_dir() -> Path:
     """Return the directory for wrapper scripts."""
+    if sys.platform == "win32":
+        return _get_default_hermes_home() / "bin"
     return Path.home() / ".local" / "bin"
+
+
+def _wrapper_paths(name: str) -> List[Path]:
+    wrapper_dir = _get_wrapper_dir()
+    if sys.platform == "win32":
+        return [wrapper_dir / f"{name}.cmd", wrapper_dir / f"{name}.ps1"]
+    return [wrapper_dir / name]
+
+
+def _existing_wrapper_path(name: str) -> Optional[Path]:
+    for path in _wrapper_paths(name):
+        if path.exists():
+            return path
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -180,22 +210,23 @@ def check_alias_collision(name: str) -> Optional[str]:
     if name in _HERMES_SUBCOMMANDS:
         return f"'{name}' conflicts with a hermes subcommand"
 
-    # Check existing commands in PATH
-    wrapper_dir = _get_wrapper_dir()
+    lookup_cmd = "where" if sys.platform == "win32" else "which"
     try:
         result = subprocess.run(
-            ["which", name], capture_output=True, text=True, timeout=5,
+            [lookup_cmd, name], capture_output=True, text=True, timeout=5,
         )
         if result.returncode == 0:
-            existing_path = result.stdout.strip()
+            existing_paths = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+            existing_path = existing_paths[0] if existing_paths else ""
             # Allow overwriting our own wrappers
-            if existing_path == str(wrapper_dir / name):
-                try:
-                    content = (wrapper_dir / name).read_text()
-                    if "hermes -p" in content:
-                        return None  # it's our wrapper, safe to overwrite
-                except Exception:
-                    pass
+            for wrapper_path in _wrapper_paths(name):
+                if str(wrapper_path) in existing_paths:
+                    try:
+                        content = wrapper_path.read_text()
+                        if "hermes -p" in content:
+                            return None  # it's our wrapper, safe to overwrite
+                    except Exception:
+                        pass
             return f"'{name}' conflicts with an existing command ({existing_path})"
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
@@ -209,41 +240,51 @@ def _is_wrapper_dir_in_path() -> bool:
     return wrapper_dir in os.environ.get("PATH", "").split(os.pathsep)
 
 
-def create_wrapper_script(name: str) -> Optional[Path]:
-    """Create a shell wrapper script at ~/.local/bin/<name>.
+def create_wrapper_script(name: str, profile_name: Optional[str] = None) -> Optional[Path]:
+    """Create a wrapper script for a profile alias.
 
-    Returns the path to the created wrapper, or None if creation failed.
+    Returns the primary launcher path, or None if creation failed.
     """
     wrapper_dir = _get_wrapper_dir()
+    target_profile = profile_name or name
     try:
         wrapper_dir.mkdir(parents=True, exist_ok=True)
     except OSError as e:
         print(f"⚠ Could not create {wrapper_dir}: {e}")
         return None
 
-    wrapper_path = wrapper_dir / name
     try:
-        wrapper_path.write_text(f'#!/bin/sh\nexec hermes -p {name} "$@"\n')
+        if sys.platform == "win32":
+            cmd_path = wrapper_dir / f"{name}.cmd"
+            ps1_path = wrapper_dir / f"{name}.ps1"
+            cmd_path.write_text(f"@echo off\r\nhermes -p {target_profile} %*\r\n")
+            ps1_path.write_text(f"hermes -p {target_profile} @args\n")
+            return cmd_path
+
+        wrapper_path = wrapper_dir / name
+        wrapper_path.write_text(f'#!/bin/sh\nexec hermes -p {target_profile} "$@"\n')
         wrapper_path.chmod(wrapper_path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
         return wrapper_path
     except OSError as e:
-        print(f"⚠ Could not create wrapper at {wrapper_path}: {e}")
+        print(f"⚠ Could not create wrapper for {name} in {wrapper_dir}: {e}")
         return None
 
 
 def remove_wrapper_script(name: str) -> bool:
     """Remove the wrapper script for a profile. Returns True if removed."""
-    wrapper_path = _get_wrapper_dir() / name
-    if wrapper_path.exists():
+    removed = False
+    for wrapper_path in _wrapper_paths(name):
+        if not wrapper_path.exists():
+            continue
         try:
             # Verify it's our wrapper before removing
             content = wrapper_path.read_text()
             if "hermes -p" in content:
                 wrapper_path.unlink()
-                return True
+                removed = True
         except Exception:
             pass
-    return False
+    return removed
 
 
 # ---------------------------------------------------------------------------
@@ -347,7 +388,7 @@ def list_profiles() -> List[ProfileInfo]:
             if not _PROFILE_ID_RE.match(name):
                 continue
             model, provider = _read_config_model(entry)
-            alias_path = wrapper_dir / name
+            alias_path = _existing_wrapper_path(name)
             profiles.append(ProfileInfo(
                 name=name,
                 path=entry,
@@ -357,7 +398,7 @@ def list_profiles() -> List[ProfileInfo]:
                 provider=provider,
                 has_env=(entry / ".env").exists(),
                 skill_count=_count_skills(entry),
-                alias_path=alias_path if alias_path.exists() else None,
+                alias_path=alias_path,
             ))
 
     return profiles
@@ -407,7 +448,6 @@ def create_profile(
     if clone_from is not None or clone_all or clone_config:
         if clone_from is None:
             # Default: clone from active profile
-            from hermes_constants import get_hermes_home
             source_dir = get_hermes_home()
         else:
             validate_profile_name(clone_from)
@@ -517,8 +557,8 @@ def delete_profile(name: str, yes: bool = False) -> Path:
     ]
 
     # Check for service
-    wrapper_path = _get_wrapper_dir() / name
-    has_wrapper = wrapper_path.exists()
+    wrapper_path = _existing_wrapper_path(name)
+    has_wrapper = wrapper_path is not None and wrapper_path.exists()
     if has_wrapper:
         items.append(f"Command alias ({wrapper_path})")
 
@@ -704,7 +744,6 @@ def get_active_profile_name() -> str:
     Returns the profile name if HERMES_HOME points into ``~/.hermes/profiles/<name>``.
     Returns ``"custom"`` if HERMES_HOME is set to an unrecognized path.
     """
-    from hermes_constants import get_hermes_home
     hermes_home = get_hermes_home()
     resolved = hermes_home.resolve()
 
