@@ -27,8 +27,9 @@ def test_update_cwd_normalizes_git_bash_path_on_windows(tmp_path, monkeypatch):
     with patch.object(LocalEnvironment, "init_session", autospec=True, return_value=None):
         env = LocalEnvironment(cwd=str(tmp_path), timeout=10)
 
+    env._cwd_file = str(tmp_path / "cwd.txt")
     cwd_file = Path(env._cwd_file)
-    cwd_file.write_text("/c/Users/Alice/project\n")
+    cwd_file.write_text("/c/Users/Alice/project\n", encoding="utf-8")
     result = {"output": "hello\n"}
 
     env._update_cwd(result)
