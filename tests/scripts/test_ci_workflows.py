@@ -17,3 +17,8 @@ def test_tests_workflow_has_windows_shell_steps():
     assert "if: runner.os == 'Windows'" in text
     assert "if: runner.os != 'Windows'" in text
     assert "uv venv .venv --python 3.11" in text
+
+
+def test_tests_workflow_runs_for_all_pull_requests():
+    text = WORKFLOW_PATH.read_text(encoding="utf-8")
+    assert "pull_request:\n    branches: [main]" not in text
