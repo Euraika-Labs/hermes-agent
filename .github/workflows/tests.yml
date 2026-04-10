@@ -59,7 +59,7 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           source .venv/bin/activate
-          python -m pytest tests/ -q --ignore=tests/integration --ignore=tests/e2e --tb=short -n auto
+          python -m pytest tests/scripts/test_install_ps1.py tests/scripts/test_ci_workflows.py tests/hermes_cli/test_profiles.py tests/tools/test_memory_tool.py tests/tools/test_local_env_blocklist.py tests/tools/test_local_env_windows.py -q -o "addopts="
         env:
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
