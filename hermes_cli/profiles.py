@@ -117,9 +117,10 @@ _HERMES_SUBCOMMANDS = frozenset({
 def _get_profiles_root() -> Path:
     """Return the directory where named profiles are stored.
 
-    Anchored to the default Hermes home, not the currently active profile.
-    This keeps named profiles discoverable even when HERMES_HOME points at a
-    profile directory, while still honoring installer-managed custom homes.
+    Anchored to the hermes root, NOT to the current HERMES_HOME
+    (which may itself be a profile). This keeps named profiles discoverable
+    while still honoring custom roots such as Docker mounts or the Windows
+    installer path.
     """
     return _get_default_hermes_home() / "profiles"
 
@@ -127,18 +128,12 @@ def _get_profiles_root() -> Path:
 def _get_default_hermes_home() -> Path:
     """Return the default (pre-profile) HERMES_HOME path.
 
-    Honors a custom HERMES_HOME root (for example the Windows installer using
-    ``%LOCALAPPDATA%\\hermes``). If the current HERMES_HOME already points to a
-    named profile under ``<root>/profiles/<name>``, returns the parent root.
+    In standard deployments this is ``~/.hermes``.
+    In Docker/custom deployments or Windows installs where HERMES_HOME points
+    elsewhere, returns the correct root directory instead.
     """
-    env_home = os.getenv("HERMES_HOME", "").strip()
-    if env_home:
-        path = Path(env_home).expanduser()
-        if path.parent.name == "profiles" and _PROFILE_ID_RE.match(path.name):
-            return path.parent.parent
-        if path.name in {"hermes", ".hermes"} or (path / "profiles").exists() or (path / "active_profile").exists():
-            return path
-    return Path.home() / ".hermes"
+    from hermes_constants import get_default_hermes_root
+    return get_default_hermes_root()
 
 
 def _get_active_profile_path() -> Path:
